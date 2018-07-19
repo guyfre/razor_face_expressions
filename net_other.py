@@ -1,16 +1,14 @@
+from slim.nets.vgg import vgg_16
+# from slim.nets.resnet_v2 import resnet_v2_50
+# from slim.nets.mobilenet.mobilenet_v2 import mobilenet
 import tensorflow as tf
 import face_data_util
 import matplotlib.pyplot as plt
 import tensorflow.contrib as con
-from slim.nets import resnet_v2
 import tensorflow.contrib.slim as slim
-
-# important note: i use slim from 2 different sources: tf.contrib.slim and the one i have as source in models
-import cv2
 import numpy as np
 import os
 from PIL import ImageFont, ImageDraw, Image
-
 
 tf.app.flags.DEFINE_string('inputs_path', '/home/rocket/PycharmProjects/test/FERPlus/data_base_dir',
                            'path to input images folder')
@@ -22,7 +20,7 @@ tf.app.flags.DEFINE_integer('val_batch_size', 256, 'val batch size')
 tf.app.flags.DEFINE_integer('image_size', 48, 'image size')
 tf.app.flags.DEFINE_integer('max_epochs', 1000, 'num of epochs')
 tf.app.flags.DEFINE_integer('save_epoch', 3, 'save checkpoint after n epochs')
-tf.app.flags.DEFINE_float('lr_init', 1e-4, 'Initial learning rate')
+tf.app.flags.DEFINE_float('lr_init', 1e-3, 'Initial learning rate')
 tf.app.flags.DEFINE_float('lr_decay', 0.5, 'learning rate decay factor')
 tf.app.flags.DEFINE_integer('decay_steps', 1000, 'num steps to decay lr')
 tf.app.flags.DEFINE_float('save_images', 1, 'number of epochs to save images')
@@ -34,30 +32,34 @@ class FerNet(object):
 
     def __init__(self):
         self.inputs = tf.placeholder(tf.float32, [None, FLAGS.image_size, FLAGS.image_size, 1], name='input')
+        self.inputs = self.preprocess(self.inputs)
         self.labels = tf.placeholder(tf.float32, [None, FLAGS.num_classes], name='labels')
-        # scope = 'net'
-        with slim.arg_scope(resnet_v2.resnet_arg_scope()):
-            self.logits, self.end_points = resnet_v2.resnet_v2_50(self.inputs, num_classes=FLAGS.num_classes)
+        self.logits, self.end_points = vgg_16(self.inputs, num_classes=FLAGS.num_classes,fc_conv_padding='same')
         self.sess = tf.InteractiveSession()
         # get the last layer before the logits
-        embedding_layer = self.end_points['global_pool']
+        embedding_layer = tf.squeeze(self.end_points['vgg_16/fc7'])
+        # embedding_layer = self.end_points['global_pool']
         # normalize it
-        embedding_layer = tf.squeeze(embedding_layer, axis=[1, 2])
+        # embedding_layer = tf.squeeze(embedding_layer, axis=[1, 2])
         embedding_layer = tf.nn.l2_normalize(embedding_layer, axis=1, name='embed_normalized')
         # calc combined loss
         with tf.name_scope('loss'):
             max_labels = tf.argmax(self.labels, axis=1)
-            dml_loss = con.losses.metric_learning.triplet_semihard_loss(max_labels, embedding_layer, margin=0.2)
+            dml_loss = con.losses.metric_learning.triplet_semihard_loss(max_labels, embedding_layer, margin=0.5)
+            # dml_loss = tf.Print(dml_loss, [dml_loss], "dml_loss: ", first_n=3, summarize=50, name='dml_loss')
             cross_entropy = tf.nn.softmax_cross_entropy_with_logits_v2(logits=self.logits, labels=self.labels,
                                                                        name='cross_entropy_loss')
             cross_entropy = tf.reduce_mean(cross_entropy)
+            # cross_entropy = tf.Print(cross_entropy, [cross_entropy], "cross_entropy: ", first_n=3, summarize=50)
             alpha = 1.
             beta = 1.
             l2_loss = tf.losses.get_regularization_loss(name='l2_loss')
             self.total_loss = tf.add(alpha * dml_loss + beta * cross_entropy, l2_loss, name='total_loss')
+            # self.total_loss = tf.Print(total_loss, [total_loss], "total_loss: ", first_n=3, summarize=50,
+            #                            name='total_loss')
 
-
-        pred_max = tf.argmax(self.end_points['predictions'], 1)
+        pred_max = tf.argmax(self.logits, 1)
+        # pred_max = tf.argmax(self.end_points['predictions'], 1)
         label_max = tf.argmax(self.labels, 1)
         self.correct_predictions = tf.equal(pred_max, label_max)
         # accuracy of the trained model, between 0 (worst) and 1 (best)
@@ -126,29 +128,13 @@ class FerNet(object):
         self.saver = tf.train.Saver(keep_checkpoint_every_n_hours=0.5)
 
     def preprocess(self, batch):
-        # remove the channel dim (1 because it is grey scale)
-        batch = np.squeeze(batch)
-        # Histogram equalization
-        if batch.dtype!=np.uint8:
-            batch = (batch*255).astype(np.uint8)
-        new_batch = np.array([cv2.equalizeHist(img) for img in batch])
-        # make values range [-1,1]
-        new_batch = (new_batch/255.-0.5)*2
-        # flip random horizontally
-        batch_size = new_batch.shape[0]
-        idx = np.random.choice(range(batch_size),batch_size/2)
-        new_batch[idx,:,:] = new_batch[idx,:,::-1]
-
-        # return the channel
-        new_batch = np.expand_dims(new_batch,axis=3)
+        with tf.name_scope('preprocess'):
+            new_batch = tf.divide(batch, 255)
+            new_batch = new_batch - 0.5
+            new_batch = new_batch * 2
         return new_batch
 
-    def get_misclassified_images(self, batch_x, batch_y, limit_size=300):
-        if batch_y.shape[0] > limit_size:
-            # choose batch randomly
-            idx = np.random.choice(range(batch_y.shape[0]), limit_size)
-            batch_x = batch_x[idx]
-            batch_y = batch_y[idx]
+    def get_misclassified_images(self, batch_x, batch_y):
         preds, labels, predictions_bool = self.sess.run([self.pred_max, self.label_max, self.correct_predictions],
                                                         feed_dict={self.inputs: batch_x, self.labels: batch_y})
         wrong_predictions = [count for count, p in enumerate(predictions_bool) if not p]
@@ -206,42 +192,24 @@ class FerNet(object):
         matrix = self.sess.run(self.cm, feed_dict={self.cm_labels: gt, self.cm_preds: preds})
         return matrix
 
-    def eval_net(self, is_all=False):
+    def eval_net(self):
         # validation set
         val_generator = face_data_util.get_next_batch(FLAGS.labels_path,
                                                       FLAGS.inputs_path,
                                                       mode='val', batch_size=FLAGS.val_batch_size, verbose=False)
-        losses = []
-        accs = []
-        merges = []
-        total_x = []
-        total_y = []
-        while True:
-            try:
-                val_x, val_y = next(val_generator)
-                val_y = val_y / 10.
-                if len(val_x.shape) == 3:
-                    # we need to add axis
-                    val_x = np.expand_dims(val_x, axis=3)
-                val_x = self.preprocess(val_x)
-                feed_dict = {self.inputs: val_x, self.labels: val_y}
-                loss, acc = self.batch_loss_acc(feed_dict)
-                merged = self.sess.run(self.merged, feed_dict=feed_dict)
-                losses.append(loss)
-                accs.append(acc)
-                merges.append(merged)
-                total_x.append(val_x)
-                total_y.append(val_y)
-                if not is_all:
-                    # finish only after one iteration
-                    break
-            except:
-                break
-        acc = np.mean(accs)
-        loss = np.mean(losses)
-        total_x = np.concatenate(total_x, axis=0)
-        total_y = np.concatenate(total_y, axis=0)
-        return total_x, total_y, acc, loss, merges[-1]
+        try:
+            val_x, val_y = next(val_generator)
+            val_y = val_y / 10.
+            if len(val_x.shape) == 3:
+                # we need to add axis
+                val_x = np.expand_dims(val_x, axis=3)
+            feed_dict = {self.inputs: val_x, self.labels: val_y}
+            loss, acc = self.batch_loss_acc(feed_dict)
+            merged = self.sess.run(self.merged, feed_dict=feed_dict)
+            return val_x, val_y, acc, loss, merged
+        except:
+            print('GOT EXCEPTION, RETURN NONE!')
+            return None
 
     def train(self):
         step = self.gstep.eval()
@@ -262,9 +230,8 @@ class FerNet(object):
                     if len(batch_x.shape) == 3:
                         # we need to add axis
                         batch_x = np.expand_dims(batch_x, axis=3)
-                    batch_x = self.preprocess(batch_x)
                 except:
-                    # stop iter
+                    # stop ite
                     break
 
                 # run the train operation
@@ -282,7 +249,7 @@ class FerNet(object):
             if (epoch % FLAGS.save_epoch) == 0:
                 self.saver.save(self.sess, FLAGS.outputs_path + '/weights/epoch', epoch)
             # calc validation accuracy
-            val_x, val_y, acc, loss, _merged = self.eval_net(is_all=True)
+            val_x, val_y, acc, loss, _merged = self.eval_net()
             self.test_writer.add_summary(_merged, step)
             # for debugging:
             loss_value, acc_value = self.batch_loss_acc(feed_dict={self.inputs: batch_x, self.labels: batch_y})

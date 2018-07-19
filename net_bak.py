@@ -6,7 +6,7 @@ from slim.nets import resnet_v2
 import tensorflow.contrib.slim as slim
 
 # important note: i use slim from 2 different sources: tf.contrib.slim and the one i have as source in models
-import cv2
+
 import numpy as np
 import os
 from PIL import ImageFont, ImageDraw, Image
@@ -34,6 +34,7 @@ class FerNet(object):
 
     def __init__(self):
         self.inputs = tf.placeholder(tf.float32, [None, FLAGS.image_size, FLAGS.image_size, 1], name='input')
+        self.inputs = self.preprocess(self.inputs)
         self.labels = tf.placeholder(tf.float32, [None, FLAGS.num_classes], name='labels')
         # scope = 'net'
         with slim.arg_scope(resnet_v2.resnet_arg_scope()):
@@ -47,15 +48,18 @@ class FerNet(object):
         # calc combined loss
         with tf.name_scope('loss'):
             max_labels = tf.argmax(self.labels, axis=1)
-            dml_loss = con.losses.metric_learning.triplet_semihard_loss(max_labels, embedding_layer, margin=0.2)
+            dml_loss = con.losses.metric_learning.triplet_semihard_loss(max_labels, embedding_layer, margin=0.5)
+            # dml_loss = tf.Print(dml_loss, [dml_loss], "dml_loss: ", first_n=3, summarize=50, name='dml_loss')
             cross_entropy = tf.nn.softmax_cross_entropy_with_logits_v2(logits=self.logits, labels=self.labels,
                                                                        name='cross_entropy_loss')
             cross_entropy = tf.reduce_mean(cross_entropy)
+            # cross_entropy = tf.Print(cross_entropy, [cross_entropy], "cross_entropy: ", first_n=3, summarize=50)
             alpha = 1.
             beta = 1.
             l2_loss = tf.losses.get_regularization_loss(name='l2_loss')
             self.total_loss = tf.add(alpha * dml_loss + beta * cross_entropy, l2_loss, name='total_loss')
-
+            # self.total_loss = tf.Print(total_loss, [total_loss], "total_loss: ", first_n=3, summarize=50,
+            #                            name='total_loss')
 
         pred_max = tf.argmax(self.end_points['predictions'], 1)
         label_max = tf.argmax(self.labels, 1)
@@ -126,21 +130,10 @@ class FerNet(object):
         self.saver = tf.train.Saver(keep_checkpoint_every_n_hours=0.5)
 
     def preprocess(self, batch):
-        # remove the channel dim (1 because it is grey scale)
-        batch = np.squeeze(batch)
-        # Histogram equalization
-        if batch.dtype!=np.uint8:
-            batch = (batch*255).astype(np.uint8)
-        new_batch = np.array([cv2.equalizeHist(img) for img in batch])
-        # make values range [-1,1]
-        new_batch = (new_batch/255.-0.5)*2
-        # flip random horizontally
-        batch_size = new_batch.shape[0]
-        idx = np.random.choice(range(batch_size),batch_size/2)
-        new_batch[idx,:,:] = new_batch[idx,:,::-1]
-
-        # return the channel
-        new_batch = np.expand_dims(new_batch,axis=3)
+        with tf.name_scope('preprocess'):
+            new_batch = tf.divide(batch, 255)
+            new_batch = new_batch - 0.5
+            new_batch = new_batch * 2
         return new_batch
 
     def get_misclassified_images(self, batch_x, batch_y, limit_size=300):
@@ -223,7 +216,6 @@ class FerNet(object):
                 if len(val_x.shape) == 3:
                     # we need to add axis
                     val_x = np.expand_dims(val_x, axis=3)
-                val_x = self.preprocess(val_x)
                 feed_dict = {self.inputs: val_x, self.labels: val_y}
                 loss, acc = self.batch_loss_acc(feed_dict)
                 merged = self.sess.run(self.merged, feed_dict=feed_dict)
@@ -262,9 +254,8 @@ class FerNet(object):
                     if len(batch_x.shape) == 3:
                         # we need to add axis
                         batch_x = np.expand_dims(batch_x, axis=3)
-                    batch_x = self.preprocess(batch_x)
                 except:
-                    # stop iter
+                    # stop ite
                     break
 
                 # run the train operation

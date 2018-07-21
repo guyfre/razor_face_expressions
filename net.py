@@ -56,8 +56,8 @@ class FerNet(object):
             l2_loss = tf.losses.get_regularization_loss(name='l2_loss')
             self.total_loss = tf.add(alpha * dml_loss + beta * cross_entropy, l2_loss, name='total_loss')
 
-
-        pred_max = tf.argmax(self.end_points['predictions'], 1)
+        self.predictions=self.end_points['predictions']
+        pred_max = tf.argmax(self.predictions, 1)
         label_max = tf.argmax(self.labels, 1)
         self.correct_predictions = tf.equal(pred_max, label_max)
         # accuracy of the trained model, between 0 (worst) and 1 (best)
@@ -167,6 +167,16 @@ class FerNet(object):
             draw.text((0, 0), pred_txt + '/' + lbl_txt, font=fnt)
             images[count] = np.asarray(pil_im)
         return images
+
+    def predict(self,batch_x):
+        pred_max,preds = self.sess.run([self.pred_max,self.self.predictions],feed_dict={self.inputs:batch_x})
+        pred_img_names = [face_data_util.labels_text[p]+'.jpeg' for p in pred_max]
+        path_pre = './emojies'
+        pred_dict = {}
+        for i in len(pred_img_names):
+            pred_dict[i]={'emoji_path':path_pre+pred_img_names[i],'preds':preds[i],'face_in':batch_x[i]}
+        return pred_dict
+
 
     def batch_loss_acc(self, feed_dict):
         # reset the local variables, update all metrics and return the result of loss and acc
